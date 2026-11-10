@@ -46,6 +46,40 @@ On a 3-minute clip from a Blu-ray Friends episode, 15 variants were compared by 
 
 Every variant is still a flag, so you can try them on your own shows.
 
+## Laugh-track detection (skips shows that don't need it)
+
+Before processing, laughless samples 10 × 30 s spread over the episode, runs the crowd model on just
+that, and measures two things:
+
+- **crowd share**: how much of the audio energy the model calls "crowd", and
+- **laugh bursts per minute**: short (0.5–6 s) crowd-dominated bursts that start after a calm moment.
+  Laughter comes in bursts after lines; music and ambience are long and steady.
+
+A file is processed only when **both** are high (defaults `--min-laugh 8` % and `--min-events 2.5`/min).
+Otherwise it's skipped with a message, so a drama in the same folder is left alone.
+`--detect-only` prints the numbers without changing anything; `--no-detect` processes regardless.
+
+Calibration so far (more shows welcome):
+
+| Show | Crowd share | Bursts/min | Verdict |
+|---|---|---|---|
+| Friends S03E12 (studio audience) | 21.3 % | 5.8 | laugh track |
+| The Mentalist S01E01–E08 (drama) | 0.2–3.3 % | 0.2–1.6 | no laugh track |
+
+A crowd share alone is fragile: with only 6 samples, one drama episode with loud crowd scenes reached 7.9 %,
+so laughless takes 10 samples and requires the burst count too. An earlier "frames with any crowd" metric scored dramas up to 29 % and was dropped.
+
+## GPUs: NVIDIA, AMD, CPU
+
+laughless itself has no GPU-specific code. The RoFormer model runs in **PyTorch**, and audio-separator uses
+whatever PyTorch reports (`torch.cuda.is_available()`), so:
+
+- **NVIDIA:** a CUDA build of PyTorch (tested: RTX 3090, ~10 min for a 22-min episode in surround mode).
+- **AMD:** a **ROCm build of PyTorch** should work the same way, because ROCm presents the GPU through the
+  same API. AMD publishes ROCm wheels, e.g. for the Radeon AI PRO R9700 / RX 9070 (gfx1201) on ROCm 7.2.
+  **Not tested yet**; reports welcome.
+- **CPU:** works, very slowly (see Limits).
+
 ## Limits (be honest with yourself)
 
 - **The pauses stay.** Actors wait for the laugh, so scenes can feel oddly quiet. `--blend 10` softens this.

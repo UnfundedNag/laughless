@@ -23,11 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_MODEL = "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt"
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".mts", ".wmv", ".webm", ".mpg", ".mpeg"}
 DEFAULT_TITLE = "No laughs"
+DEFAULT_MIN_LAUGH = 8.0    # crowd share of audio energy (%); calibrated: sitcom ~21, drama <= 3.3 (README)
+DEFAULT_MIN_EVENTS = 2.5  # laugh-shaped bursts per minute; calibrated: sitcom ~5.6, drama <= 1.0
 
 
 def log(msg: str) -> None:
@@ -128,6 +130,68 @@ class Remover:
             keep[0].rename(nxt)
             cur = nxt
         return cur
+
+    def laugh_score(self, wav: Path) -> tuple[float, float]:
+        """Share (percent) of the sample's audio energy that the model assigns to the crowd.
+
+        Calibrated on 5-minute samples (README: Detection): a multi-camera sitcom with an audience
+        (Friends) scored 21 %, a drama with music and crowd scenes (The Mentalist, 4 episodes)
+        0.2-3.3 %. An earlier frame-count metric could not tell them apart (drama scored up to 29)."""
+        import numpy as np
+        import soundfile as sf
+        outs = [self.work / Path(o).name for o in self.sep.separate(str(wav))]
+        crowd = [o for o in outs if "(crowd)" in o.name.lower()]
+        if not crowd:
+            raise RuntimeError(f"model gave no crowd stem: {[o.name for o in outs]}")
+        mix, sr = sf.read(str(wav), always_2d=True)
+        cr, _ = sf.read(str(crowd[0]), always_2d=True)
+        for o in outs:
+            o.unlink(missing_ok=True)
+        n = min(len(mix), len(cr))
+        m = mix[:n].mean(axis=1)
+        c = cr[:n].mean(axis=1)
+        total = float((m ** 2).sum())
+        if total <= 1e-9:
+            return 0.0, 0.0
+        share = 100.0 * float((c ** 2).sum()) / total
+        # Laugh-shaped bursts: 0.5-6 s stretches where the crowd carries >40 % of the level,
+        # starting after a calm second (laughs follow lines; music and ambience are long and steady).
+        hop = int(sr * 0.1)
+        f = n // hop
+        rm = np.sqrt((m[: f * hop].reshape(f, hop) ** 2).mean(axis=1) + 1e-12)
+        rc = np.sqrt((c[: f * hop].reshape(f, hop) ** 2).mean(axis=1) + 1e-12)
+        act = (rc > 0.4 * rm) & (rm > 10 ** (-50 / 20))
+        events, i = 0, 0
+        while i < f:
+            if act[i]:
+                j = i
+                while j < f and act[j]:
+                    j += 1
+                if 5 <= j - i <= 60 and (i == 0 or act[max(0, i - 10):i].mean() < 0.3):
+                    events += 1
+                i = j
+            else:
+                i += 1
+        return share, events / max(f / 600.0, 1e-9)
+
+
+def sample_audio(src: Path, idx: int, duration: float, work: Path, windows: int = 10, length: float = 30.0) -> Path:
+    """Stereo wav of `windows` slices of `length` s spread over the episode (skipping the first/last 8 %)."""
+    out = work / "detect.wav"
+    if duration <= windows * length * 1.5:
+        run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", f"0:a:{idx}",
+             "-ac", "2", "-ar", "44100", str(out)])
+        return out
+    lo, hi = duration * 0.08, duration * 0.92 - length
+    starts = [lo + (hi - lo) * i / (windows - 1) for i in range(windows)]
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
+    for s in starts:
+        cmd += ["-ss", f"{s:.1f}", "-t", str(length), "-i", str(src)]
+    chains = "".join(f"[{i}:a:{idx}]aresample=44100,aformat=channel_layouts=stereo[a{i}];" for i in range(windows))
+    cmd += ["-filter_complex", chains + "".join(f"[a{i}]" for i in range(windows)) + f"concat=n={windows}:v=0:a=1[o]",
+            "-map", "[o]", str(out)]
+    run(cmd)
+    return out
 
 
 def build_track(src: Path, idx: int, stream: dict, args, rm: Remover, work: Path) -> Path:
@@ -272,6 +336,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bitrate", default="192k", help="bitrate of the new track (ignored for flac)")
     ap.add_argument("--audio-only", metavar="FILE.wav", help="don't mux: just write the processed audio to this wav")
     ap.add_argument("--force", action="store_true", help="process even if a track with --title already exists")
+    ap.add_argument("--no-detect", action="store_true",
+                    help="skip the laugh-track check (by default files without a laugh track are left alone)")
+    ap.add_argument("--min-laugh", type=float, default=DEFAULT_MIN_LAUGH, metavar="PCT",
+                    help=f"min. crowd share of the audio energy for a laugh track (default {DEFAULT_MIN_LAUGH:g})")
+    ap.add_argument("--min-events", type=float, default=DEFAULT_MIN_EVENTS, metavar="N",
+                    help=f"min. laugh-shaped bursts per minute for a laugh track (default {DEFAULT_MIN_EVENTS:g})")
+    ap.add_argument("--detect-only", action="store_true", help="only print each file's laugh score, change nothing")
     ap.add_argument("--keep-temp", action="store_true", help="keep the working folder (for debugging)")
     ap.add_argument("--version", action="version", version=f"laughless {__version__}")
     args = ap.parse_args(argv)
@@ -301,6 +372,19 @@ def main(argv: list[str] | None = None) -> int:
                 rm.sep.output_dir = str(work)
                 if getattr(rm.sep, "model_instance", None) is not None:
                     rm.sep.model_instance.output_dir = str(work)
+                if args.detect_only or not args.no_detect:
+                    dur = float(info.get("format", {}).get("duration") or stream.get("duration") or 0)
+                    share, epm = rm.laugh_score(sample_audio(src, idx, dur, work))
+                    laughs = share >= args.min_laugh and epm >= args.min_events
+                    verdict = "laugh track" if laughs else "no laugh track"
+                    if args.detect_only:
+                        print(f"crowd {share:5.1f}%  bursts/min {epm:4.1f}  {verdict:15s}  {src}")
+                        continue
+                    if not laughs:
+                        log(f"skip (no laugh track: crowd {share:.1f}% / {epm:.1f} bursts per min, need >= "
+                            f"{args.min_laugh:g}% and {args.min_events:g}; --no-detect to process anyway): {src}")
+                        continue
+                    log(f"laugh track detected (crowd {share:.1f}%, {epm:.1f} bursts/min): processing")
                 track = build_track(src, idx, stream, args, rm, work)
                 if args.audio_only:
                     shutil.copy(track, args.audio_only)
