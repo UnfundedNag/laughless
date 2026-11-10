@@ -1,0 +1,1 @@
+audio-separator>=0.48
