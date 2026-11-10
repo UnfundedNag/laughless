@@ -4,7 +4,7 @@ Add a **"No laughs" audio track** to sitcom episodes: the same episode, with the
 track removed by an AI separation model. Your original audio stays untouched and remains the default track;
 pick "No laughs" in Jellyfin, Plex, VLC, mpv or whatever you watch with.
 
-> **Status: v0.1, early.** It works well on the episodes it has been tried on, but the defaults were tuned
+> **Status: early (v0.3).** It works well on the episodes it has been tried on, but the defaults were tuned
 > by ear on a handful of clips. Feedback and comparison clips are welcome.
 
 ## How it works
@@ -72,23 +72,37 @@ so laughless takes 10 samples and requires the burst count too. An earlier "fram
 ## GPUs: NVIDIA, AMD, CPU
 
 laughless itself has no GPU-specific code. The RoFormer model runs in **PyTorch**, and audio-separator uses
-whatever PyTorch reports (`torch.cuda.is_available()`), so:
+whatever PyTorch reports (`torch.cuda.is_available()`), so NVIDIA (CUDA builds of PyTorch) and **AMD (ROCm
+builds)** both work, and CPU works too (slowly). The default `--precision auto` uses **mixed precision on a GPU**
+and full precision on CPU.
 
-- **NVIDIA:** a CUDA build of PyTorch (tested: RTX 3090, ~10 min for a 22-min episode in surround mode).
-- **AMD: tested.** A **ROCm build of PyTorch** works the same way, because ROCm presents the GPU through the
-  same API. On a **Radeon AI PRO R9700** (RDNA4, gfx1201; PyTorch 2.13.0+rocm7.1, ROCm 7.2.1 userspace) the
-  output was **identical** to the RTX 3090's (correlation 1.0, difference −96 dB), at about **3.7× the time**
-  (105 s vs 28 s for one minute of 5.1 audio, warm). Faster ROCm builds or tuning may close the gap; reports welcome.
-- **CPU:** works, very slowly (see Limits).
+### Speed: RTX 3090 vs Radeon AI PRO R9700
+
+Model separation time for 60.7 s of audio, one pass, measured with `bench.py` in this repo (model load excluded):
+
+| Precision | RTX 3090 (CUDA 13.0) | R9700 (ROCm 7.1 wheels, gfx1201) | Difference vs fp32 output |
+|---|---|---|---|
+| fp32 (`--precision fp32`) | 18.9 s, 3.2× real time | 82.0 s, **0.74× real time** | reference |
+| mixed / autocast (**default on GPU**) | 10.0 s, 6.1× | 13.0 s, 4.7× | −71 to −72 dB |
+| native fp16 (`--precision fp16`) | 9.6 s, 6.4× | 11.5 s, 5.3× | −68 to −69 dB |
+
+- **Half precision is the big lever**: ~2× on the 3090 and **~7× on the R9700**. In fp32 the R9700 is slower
+  than real time; with half precision it's within ~20 % of the 3090. RDNA4's matrix units only speed up
+  16-bit maths. Differences of ~70 dB down are inaudible.
+- `--precision fp16` also halves GPU memory (about 1 GB instead of 1.7–2 GB), handy on a shared card.
+- With the default precision, the NVIDIA and AMD outputs are the same to well below audibility (fp32 outputs
+  matched with correlation 1.0, −96 dB).
+- Real-world on the 3090: a full 22-minute 5.1 episode (two passes, surround mode) took ~10 min in fp32,
+  so roughly 5–6 min with the default. Model load is 3–8 s per run, once per batch.
 
 ## Limits (be honest with yourself)
 
 - **The pauses stay.** Actors wait for the laugh, so scenes can feel oddly quiet. `--blend 10` softens this.
 - **Leftovers.** Big or overlapping laughs can leave traces, and the model sometimes trims a little of a
   voice that overlaps a laugh.
-- **Speed.** RoFormer is heavy. On a modern NVIDIA GPU, an episode takes minutes. **On CPU it's very slow**:
-  roughly 10× the episode length per pass, and surround mode does two passes. Use `--start/--duration`
-  to preview a short clip first.
+- **Speed.** RoFormer is heavy. On a recent NVIDIA or AMD GPU an episode takes minutes (see the speed table).
+  **On CPU it's very slow**: roughly 10× the episode length per pass, and surround mode does two passes.
+  Use `--start/--duration` to preview a short clip first.
 - The new track is stereo, even when the original is 5.1.
 
 ## Install
@@ -102,16 +116,23 @@ python3 -m venv ~/.venvs/laughless
 curl -LO https://raw.githubusercontent.com/UnfundedNag/laughless/main/laughless.py
 ```
 
-**AMD (ROCm):** install PyTorch for ROCm first, then audio-separator *without* the GPU extra, plus the CPU
-onnxruntime it always imports (it's only used by the older ONNX models; RoFormer runs in PyTorch on the GPU):
+**AMD (ROCm): what you must do** (tested on a Radeon AI PRO R9700, Ubuntu 24.04, ROCm 7.2.1):
 
-```bash
-~/.venvs/laughless/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.1
-~/.venvs/laughless/bin/pip install audio-separator onnxruntime audioread
-```
-
-Building audio-separator's dependencies needs a C compiler and Python headers (`build-essential python3-dev`
-on Debian/Ubuntu). Make sure `--model-dir` is writable: audio-separator writes small index files next to the model.
+1. Install **PyTorch for ROCm first**, before audio-separator, so pip doesn't pull a CUDA or CPU build:
+   ```bash
+   ~/.venvs/laughless/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.1
+   ```
+2. Install audio-separator **without** the `[gpu]` extra (that one is CUDA), **plus `onnxruntime`**. audio-separator
+   always imports it, even though RoFormer runs in PyTorch on the GPU:
+   ```bash
+   ~/.venvs/laughless/bin/pip install audio-separator onnxruntime audioread
+   ```
+3. Have a C compiler and Python headers for its dependencies (`sudo apt install build-essential python3-dev`).
+4. Make sure the **model folder is writable** (`--model-dir`). audio-separator writes small index files next to the
+   model, and a read-only folder fails with "Permission denied: …download_checks.json".
+5. Check: `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` should
+   print `True` and your Radeon. laughless prints the device and backend (`ROCm …`) when it starts.
+6. Keep the default `--precision auto` (or `fp16`). **fp32 is about 7× slower on RDNA4.**
 
 On Python 3.13 you may also need `pip install audioread audioop-lts standard-aifc standard-sunau`.
 For CPU-only installs, install `torch torchvision torchaudio` together from

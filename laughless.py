@@ -23,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_MODEL = "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt"
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".mts", ".wmv", ".webm", ".mpg", ".mpeg"}
@@ -103,13 +103,31 @@ def sides_pan(ch: list[str]) -> str:
 class Remover:
     """Loads the separation model once and reuses it for every pass and file."""
 
-    def __init__(self, model: str, model_dir: str | None, overlap: int | None, work: Path):
-        from audio_separator.separator import Separator  # imported late so --help works without it
+    def __init__(self, model: str, model_dir: str | None, overlap: int | None, work: Path, precision: str = "auto"):
+        try:  # imported late so --help works without it
+            from audio_separator.separator import Separator
+        except ModuleNotFoundError as e:
+            hint = {"onnxruntime": "audio-separator always imports onnxruntime: pip install onnxruntime "
+                                   "(the CPU package is fine on AMD/ROCm; the RoFormer model runs in PyTorch)",
+                    "audioread": "pip install audioread (on Python 3.13 also audioop-lts standard-aifc standard-sunau)",
+                    "audio_separator": "pip install audio-separator (see README: Install)"}.get(e.name, "see README: Install")
+            raise RuntimeError(f"missing Python package '{e.name}': {hint}") from None
+        import torch
+        gpu = torch.cuda.is_available()          # True for NVIDIA (CUDA) and AMD (ROCm) builds of PyTorch
+        if precision == "auto":
+            precision = "autocast" if gpu else "fp32"
         params = {}
+        if precision == "autocast":
+            params["use_autocast"] = True
+        elif precision == "fp16":
+            params["use_native_fp16"] = True
         if overlap:
             params["mdxc_params"] = {"segment_size": 256, "override_model_segment_size": False,
                                      "batch_size": 1, "overlap": overlap, "pitch_shift": 0}
         self.work = work
+        name = torch.cuda.get_device_name(0) if gpu else "CPU"
+        backend = f"ROCm {torch.version.hip}" if getattr(torch.version, "hip", None) else (f"CUDA {torch.version.cuda}" if gpu else "no GPU")
+        log(f"device: {name} ({backend}), precision {precision}")
         self.sep = Separator(output_dir=str(work), output_format="WAV",
                              model_file_dir=model_dir or os.path.expanduser("~/.cache/laughless/models"),
                              log_level=40, **params)
@@ -325,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL, help="any separation model audio-separator knows")
     ap.add_argument("--model-dir", help="where models are cached (default ~/.cache/laughless/models)")
     ap.add_argument("--overlap", type=int, help="Roformer overlap (default: model's own; 16 is slower, smoother)")
+    ap.add_argument("--precision", choices=["auto", "fp32", "autocast", "fp16"], default="auto",
+                    help="auto (default): mixed precision on a GPU, fp32 on CPU. Half precision is ~2x faster on an "
+                         "RTX 3090 and ~7x on a Radeon R9700, with differences ~70 dB down (inaudible); "
+                         "fp16 also halves GPU memory")
     ap.add_argument("--audio-stream", type=int, help="which audio stream to use (0-based); default = the default one")
     ap.add_argument("--start", type=float, help="preview: start at this many seconds")
     ap.add_argument("--duration", type=float, help="preview: only this many seconds")
@@ -367,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             work = Path(tempfile.mkdtemp(prefix="laughless-"))
             try:
                 if rm is None:
-                    rm = Remover(args.model, args.model_dir, args.overlap, work)
+                    rm = Remover(args.model, args.model_dir, args.overlap, work, args.precision)
                 rm.work = work
                 rm.sep.output_dir = str(work)
                 if getattr(rm.sep, "model_instance", None) is not None:
