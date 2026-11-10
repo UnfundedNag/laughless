@@ -75,9 +75,10 @@ laughless itself has no GPU-specific code. The RoFormer model runs in **PyTorch*
 whatever PyTorch reports (`torch.cuda.is_available()`), so:
 
 - **NVIDIA:** a CUDA build of PyTorch (tested: RTX 3090, ~10 min for a 22-min episode in surround mode).
-- **AMD:** a **ROCm build of PyTorch** should work the same way, because ROCm presents the GPU through the
-  same API. AMD publishes ROCm wheels, e.g. for the Radeon AI PRO R9700 / RX 9070 (gfx1201) on ROCm 7.2.
-  **Not tested yet**; reports welcome.
+- **AMD: tested.** A **ROCm build of PyTorch** works the same way, because ROCm presents the GPU through the
+  same API. On a **Radeon AI PRO R9700** (RDNA4, gfx1201; PyTorch 2.13.0+rocm7.1, ROCm 7.2.1 userspace) the
+  output was **identical** to the RTX 3090's (correlation 1.0, difference −96 dB), at about **3.7× the time**
+  (105 s vs 28 s for one minute of 5.1 audio, warm). Faster ROCm builds or tuning may close the gap; reports welcome.
 - **CPU:** works, very slowly (see Limits).
 
 ## Limits (be honest with yourself)
@@ -92,7 +93,7 @@ whatever PyTorch reports (`torch.cuda.is_available()`), so:
 
 ## Install
 
-Requirements: Python 3.10+, `ffmpeg`/`ffprobe` on your PATH.
+Requirements: Python 3.10+, `ffmpeg`/`ffprobe` on your PATH. NVIDIA (CUDA), AMD (ROCm) or CPU.
 
 ```bash
 python3 -m venv ~/.venvs/laughless
@@ -100,6 +101,17 @@ python3 -m venv ~/.venvs/laughless
 # or: ~/.venvs/laughless/bin/pip install "audio-separator[cpu]"
 curl -LO https://raw.githubusercontent.com/UnfundedNag/laughless/main/laughless.py
 ```
+
+**AMD (ROCm):** install PyTorch for ROCm first, then audio-separator *without* the GPU extra, plus the CPU
+onnxruntime it always imports (it's only used by the older ONNX models; RoFormer runs in PyTorch on the GPU):
+
+```bash
+~/.venvs/laughless/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.1
+~/.venvs/laughless/bin/pip install audio-separator onnxruntime audioread
+```
+
+Building audio-separator's dependencies needs a C compiler and Python headers (`build-essential python3-dev`
+on Debian/Ubuntu). Make sure `--model-dir` is writable: audio-separator writes small index files next to the model.
 
 On Python 3.13 you may also need `pip install audioread audioop-lts standard-aifc standard-sunau`.
 For CPU-only installs, install `torch torchvision torchaudio` together from
